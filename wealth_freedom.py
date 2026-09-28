@@ -987,7 +987,11 @@ def format_lifeline(rows):
 
 
 def chart_path():
-    if "__file__" in globals():
+    if getattr(sys, "frozen", False):
+        # PyInstaller onefile：__file__ 指向临时解包目录，退出即删除，
+        # 必须改用 exe 自身所在目录，用户才能找到图。
+        base_dir = os.path.dirname(os.path.abspath(sys.executable))
+    elif "__file__" in globals():
         base_dir = os.path.dirname(os.path.abspath(__file__))
     else:
         base_dir = os.getcwd()
