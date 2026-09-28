@@ -7,11 +7,15 @@
 双击运行（不带命令行参数）→ 逐项问答；带参数运行 → 命令行直通。
 
 公式：
-    实际年收益率 r    = (1 + 名义收益率) / (1 + 通胀率) - 1
-    月利率        r_m = (1 + r)^(1/12) - 1
-    自由门槛      T   = 年支出 / 提取率
-    积累期终值    FV  = P*(1+r_m)^N + PMT*((1+r_m)^N - 1)/r_m
-    消耗期递推    A'  = A*(1+r) - 年支出
+    实际年收益率   r    = (1 + 名义收益率) / (1 + 通胀率) - 1
+    实际收入增长率 g    = (1 + 名义收入增长率) / (1 + 通胀率) - 1
+    月利率         r_m  = (1 + r)^(1/12) - 1
+    自由门槛       T    = 年支出 / 提取率
+    第 t 年年储蓄       = 年储蓄0 * (1 + g)^t
+    积累期终值     FV   = P*(1+r_m)^N + PMT*((1+r_m)^N - 1)/r_m   # 仅 g = 0 时
+    消耗期递推     A'   = A*(1+r) - 年支出
+
+年支出支持两种输入：直接填年总支出（简式），或逐项填写明细（求和即年支出）。
 """
 
 from __future__ import annotations
@@ -39,9 +43,54 @@ CHART_FILENAME = "wealth_freedom.png"
 
 ASSERT_TOLERANCE = 1e-6
 
+# 支出明细目录：(类目, 条目, 默认频率, 全国基准参考值/元)。
+# 基准值仅为量级估算，不来自任何官方统计口径，只用于降低填写门槛。
+EXPENSE_CATALOG = (
+    ("住房", "房租或房贷月供", "月", 2000.0),
+    ("住房", "物业水电燃气", "月", 400.0),
+    ("餐饮", "日常吃饭", "月", 1800.0),
+    ("餐饮", "外出聚餐", "月", 400.0),
+    ("交通", "通勤", "月", 300.0),
+    ("交通", "车辆油费保养保险", "年", 12000.0),
+    ("购物", "衣物", "月", 500.0),
+    ("购物", "洗护日用品", "月", 200.0),
+    ("购物", "电子产品", "年", 4000.0),
+    ("健康", "保险", "年", 6000.0),
+    ("健康", "体检与常备药", "月", 200.0),
+    ("旅行", "年度旅行预算", "年", 10000.0),
+    ("其他", "人情往来", "年", 5000.0),
+    ("其他", "订阅与娱乐", "月", 200.0),
+    ("其他", "教育", "年", 6000.0),
+)
+
+# 城市档乘数（相对全国基准 1.0），同样为粗略估算，只影响明细模式的参考值。
+CITY_TIERS = {
+    "一线": 1.3,
+    "新一线": 1.0,
+    "二线": 0.85,
+    "三四线": 0.7,
+}
+
+# 问答时城市档的展示文案。
+CITY_PROMPTS = {
+    "一线": "一线（北上广深）",
+    "新一线": "新一线",
+    "二线": "二线",
+    "三四线": "三四线及以下",
+}
+
 
 class TargetUnreachable(Exception):
     """在当前参数下无法达成财富自由。"""
+
+
+class ExpenseItem(NamedTuple):
+    """一条分项支出。"""
+
+    category: str      # 类目
+    item: str          # 条目
+    amount: float      # 金额（元）
+    period: str        # 频率：「月」或「年」
 
 
 @dataclass(frozen=True)
@@ -57,14 +106,18 @@ class Context:
     r_month: float            # 实际月收益率（小数）
     annual_income: float      # 年收入（元），未知时为 None
     annual_expense: float     # 年支出（元）
-    annual_save: float        # 年储蓄（元）
+    annual_save: float        # 第 0 年年储蓄（元）
     principal: float          # 现有可投资资产（元）
     target: float             # 自由门槛（元）
     goal_years: float         # 目标年限，仅 --years 显式给出时非 None
+    income_growth: float      # 名义年收入增长率 %
+    real_income_growth: float # 实际年收入增长率（小数）
+    expense_items: tuple      # 分项支出列表，简式模式为 None
+    city_tier: str            # 城市档，命令行或简式模式为 None
 
     @property
     def monthly_save(self):
-        """每月储蓄（元），由年储蓄折算。"""
+        """第 0 年的每月储蓄（元）。"""
         return self.annual_save / MONTHS_PER_YEAR
 
 
@@ -126,6 +179,38 @@ def rate_list(text):
     return rates
 
 
+def growth_rate(text):
+    """argparse 类型：名义收入增长率 %，允许为负但不能到 -100%。"""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"不是合法数字：{text}") from None
+    if value <= -100:
+        raise argparse.ArgumentTypeError(f"必须大于 -100：{text}")
+    return value
+
+
+def expense_item(text):
+    """argparse 类型：分项支出，格式 `类目:条目:金额:频率`（金额单位：元）。"""
+    parts = text.split(":")
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError(
+            f"格式应为 类目:条目:金额:频率（金额单位元），收到：{text}"
+        )
+    category, name, amount_text, period = (part.strip() for part in parts)
+    if not category or not name:
+        raise argparse.ArgumentTypeError(f"类目与条目不能为空：{text}")
+    if period not in ("月", "年"):
+        raise argparse.ArgumentTypeError(f"频率只能是「月」或「年」，收到：{period}")
+    try:
+        amount = float(amount_text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"金额不是合法数字：{amount_text}") from None
+    if amount < 0:
+        raise argparse.ArgumentTypeError(f"金额不能为负数：{amount_text}")
+    return ExpenseItem(category, name, amount, period)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="wealth_freedom.py",
@@ -141,7 +226,12 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--annual-expense", type=non_negative, default=None, metavar="万",
-        help="年支出，单位万元（必填）",
+        help="年支出，单位万元（未给 --expense-item 时必填）",
+    )
+    parser.add_argument(
+        "--expense-item", type=expense_item, action="append", default=None,
+        metavar="类目:条目:金额:频率",
+        help="分项支出，金额单位元，可重复；给出后年支出 = 各项年化之和",
     )
     parser.add_argument(
         "--assets", type=non_negative, default=0.0, metavar="万",
@@ -162,6 +252,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--inflation", type=non_negative, default=DEFAULT_INFLATION, metavar="%",
         help=f"通胀率 %% （默认 {DEFAULT_INFLATION}）",
+    )
+    parser.add_argument(
+        "--income-growth", type=growth_rate, default=None, metavar="%",
+        help="名义年收入增长率 %%；默认取通胀率（实际不涨不减），可填 0 或负数",
     )
     parser.add_argument(
         "--withdrawal", type=positive, default=DEFAULT_WITHDRAWAL, metavar="%",
@@ -192,10 +286,13 @@ def parse_args(argv=None):
     if args.selftest:
         return args
 
+    if args.expense_item and args.annual_expense is not None:
+        parser.error("不能同时指定 --expense-item 与 --annual-expense")
+
     missing = []
     if args.age is None:
         missing.append("--age")
-    if args.annual_expense is None:
+    if args.annual_expense is None and not args.expense_item:
         missing.append("--annual-expense")
     if missing:
         parser.error("缺少必填参数：" + "、".join(missing))
@@ -204,13 +301,23 @@ def parse_args(argv=None):
 
 def params_from_args(args):
     """把命令行参数整理成统一的参数字典。"""
-    annual_expense = args.annual_expense * WAN
+    items = args.expense_item
+    if items:
+        annual_expense = expense_items_total(items)
+        if annual_expense <= 0:
+            raise ValueError("分项支出合计为 0，请至少填写一项")
+    else:
+        annual_expense = args.annual_expense * WAN
+
     if args.annual_income is not None:
         annual_income = args.annual_income * WAN
         annual_save = annual_income - annual_expense
     else:
         annual_income = None
         annual_save = args.monthly_save * MONTHS_PER_YEAR
+
+    income_growth = args.inflation if args.income_growth is None else args.income_growth
+
     return {
         "age": args.age,
         "principal": args.assets * WAN,
@@ -220,8 +327,11 @@ def params_from_args(args):
         "nominal": args.return_rate,
         "inflation": args.inflation,
         "withdrawal": args.withdrawal,
+        "income_growth": income_growth,
         "life_expectancy": args.life_expectancy,
         "goal_years": args.goal_years,
+        "expense_items": tuple(items) if items else None,
+        "city_tier": None,
     }
 
 
@@ -231,8 +341,11 @@ def build_context(params):
         raise ValueError("预期寿命必须大于当前年龄")
     if params["annual_save"] < 0:
         raise ValueError("入不敷出，年储蓄为负，无法积累")
+    if params["income_growth"] <= -100:
+        raise ValueError("收入增长率必须大于 -100%")
 
     real = real_rate(params["nominal"], params["inflation"])
+    real_g = real_income_growth(params["income_growth"], params["inflation"])
     return Context(
         age=params["age"],
         life_expectancy=params["life_expectancy"],
@@ -247,6 +360,10 @@ def build_context(params):
         principal=params["principal"],
         target=fire_target(params["annual_expense"], params["withdrawal"]),
         goal_years=params["goal_years"],
+        income_growth=params["income_growth"],
+        real_income_growth=real_g,
+        expense_items=params.get("expense_items"),
+        city_tier=params.get("city_tier"),
     )
 
 
@@ -289,6 +406,76 @@ def ask_float(prompt, default=None, minimum=None, maximum=None, hint=None):
         return value
 
 
+def ask_choice(prompt, options, default):
+    """选项问答：options 为 [(键, 说明)]，回车采用 default，返回所选键。"""
+    for key, label in options:
+        print(f"  {key}) {label}")
+    keys = "/".join(key for key, _ in options)
+    while True:
+        raw = input(f"{prompt}（默认 {default}）：").strip()
+        if not raw:
+            return default
+        if any(raw == key for key, _ in options):
+            return raw
+        print(f"  请输入 {keys} 之一。")
+
+
+def ask_expense_items(multiplier):
+    """逐项询问明细支出，返回 ExpenseItem 列表；直接回车表示该项为 0。"""
+    print()
+    print(f"逐项填写支出，直接回车表示该项为 0（金额单位：元，"
+          f"参考值 = 全国基准 × {multiplier}）。")
+    items = []
+    last_category = None
+    for category, name, period, baseline in EXPENSE_CATALOG:
+        if category != last_category:
+            print(f"[{category}]")
+            last_category = category
+        unit = "元/月" if period == "月" else "元/年"
+        amount = ask_float(
+            f"  {name}（{unit}，参考 {baseline * multiplier:.0f}）",
+            default=0.0, minimum=0.0,
+        )
+        if amount > 0:
+            items.append(ExpenseItem(category, name, amount, period))
+    print()
+    return items
+
+
+def ask_expense(income_yuan):
+    """询问支出模式，返回 (年支出元, 明细列表或 None, 城市档或 None)。"""
+    while True:
+        mode = ask_choice(
+            "支出模式",
+            [("1", "简式：直接填写年总支出"),
+             ("2", "明细：按类目逐项填写各项支出")],
+            default="1",
+        )
+        if mode == "1":
+            expense_wan = ask_float(
+                "年支出（万元）", minimum=0.0, maximum=income_yuan / WAN,
+                hint="年支出不能大于年收入（入不敷出，无法积累）。",
+            )
+            return expense_wan * WAN, None, None
+
+        tiers = list(CITY_TIERS)
+        tier = ask_choice(
+            "城市档",
+            [(str(index + 1), CITY_PROMPTS[key]) for index, key in enumerate(tiers)],
+            default="2",
+        )
+        tier = tiers[int(tier) - 1]
+        items = ask_expense_items(CITY_TIERS[tier])
+        total = expense_items_total(items)
+        if total <= 0:
+            print("  明细合计为 0，请至少填写一项或选择简式。\n")
+            continue
+        if total > income_yuan:
+            print("  明细合计已超过年收入（入不敷出，无法积累），请重新填写。\n")
+            continue
+        return total, tuple(items), tier
+
+
 def ask_params():
     """双击运行时逐项问答，返回与命令行路径一致的参数字典。"""
     print("=== 财富自由推演 ===")
@@ -297,13 +484,17 @@ def ask_params():
     age = ask_int("当前年龄（岁）", minimum=1)
     asset_wan = ask_float("当前资产（万元）", minimum=0.0)
     income_wan = ask_float("年收入（万元）", minimum=0.0)
-    expense_wan = ask_float(
-        "年支出（万元）", minimum=0.0, maximum=income_wan,
-        hint="年支出不能大于年收入（入不敷出，无法积累）。",
-    )
+    income_yuan = income_wan * WAN
+
+    expense_yuan, items, tier = ask_expense(income_yuan)
+
     nominal = ask_float("名义年化收益率（%）", default=DEFAULT_RETURN, minimum=0.0)
     inflation = ask_float("通胀率（%）", default=DEFAULT_INFLATION, minimum=0.0)
     withdrawal = ask_float("安全提取率（%）", default=DEFAULT_WITHDRAWAL, minimum=0.1)
+    income_growth = ask_float(
+        "名义年收入增长率（%）", default=inflation, minimum=-99.99,
+        hint="收入增长率必须大于 -100%。",
+    )
     life = ask_int(
         "预期寿命（岁）", default=DEFAULT_LIFE_EXPECTANCY, minimum=age + 1,
         hint=f"预期寿命必须大于当前年龄 {age} 岁。",
@@ -313,14 +504,17 @@ def ask_params():
     return {
         "age": age,
         "principal": asset_wan * WAN,
-        "annual_income": income_wan * WAN,
-        "annual_expense": expense_wan * WAN,
-        "annual_save": (income_wan - expense_wan) * WAN,
+        "annual_income": income_yuan,
+        "annual_expense": expense_yuan,
+        "annual_save": income_yuan - expense_yuan,
         "nominal": nominal,
         "inflation": inflation,
         "withdrawal": withdrawal,
+        "income_growth": income_growth,
         "life_expectancy": life,
         "goal_years": None,
+        "expense_items": items,
+        "city_tier": tier,
     }
 
 
@@ -332,6 +526,11 @@ def ask_params():
 def real_rate(nominal_pct, inflation_pct):
     """名义收益率折算为实际收益率（小数）。"""
     return (1 + nominal_pct / 100) / (1 + inflation_pct / 100) - 1
+
+
+def real_income_growth(nominal_growth_pct, inflation_pct):
+    """名义收入增长率折算为实际收入增长率（小数）。"""
+    return (1 + nominal_growth_pct / 100) / (1 + inflation_pct / 100) - 1
 
 
 def monthly_rate(annual_real):
@@ -349,6 +548,33 @@ def saving_rate(annual_income, annual_expense):
     if not annual_income:
         return None
     return (annual_income - annual_expense) / annual_income
+
+
+def annualize(amount, period):
+    """把按月/年记录的金额折算为年化金额（元）。"""
+    return amount * MONTHS_PER_YEAR if period == "月" else amount
+
+
+def expense_items_total(items):
+    """分项支出的年化金额之和（元）。"""
+    return sum(annualize(item.amount, item.period) for item in items)
+
+
+def expense_breakdown(items):
+    """分项明细，按年化金额降序，返回 [(类目, 条目, 年化金额, 占比)]。"""
+    total = expense_items_total(items)
+    rows = sorted(
+        ((item.category, item.item, annualize(item.amount, item.period)) for item in items),
+        key=lambda row: row[2],
+        reverse=True,
+    )
+    return [(category, name, amount, amount / total if total else 0.0)
+            for category, name, amount in rows]
+
+
+def baseline_expense(catalog_row, multiplier):
+    """参考值 = 条目全国基准 × 城市乘数（元）。"""
+    return catalog_row[3] * multiplier
 
 
 def months_to_target(principal, monthly_save, target, r_month):
@@ -410,23 +636,59 @@ def simulate_months(principal, monthly_save, r_month, months):
     return series
 
 
-def reach_age(ctx, nominal_pct=None, inflation_pct=None, annual_save=None):
-    """给定（可覆盖的）参数下的达成年龄；无法达标返回 None。"""
+def accumulate_one_year(assets, monthly_save, r_month):
+    """积累一年（月末定投），返回 (年末资产, 当年收益)。"""
+    earned = 0.0
+    for _ in range(MONTHS_PER_YEAR):
+        interest = assets * r_month
+        assets += interest + monthly_save
+        earned += interest
+    return assets, earned
+
+
+def annual_save_at(ctx, year_index):
+    """第 year_index 年（从 0 起）的年储蓄（元），按实际收入增长率逐年复利。"""
+    return ctx.annual_save * (1 + ctx.real_income_growth) ** year_index
+
+
+def reach_age(ctx, nominal_pct=None, inflation_pct=None, annual_save=None,
+              income_growth_pct=None):
+    """给定（可覆盖的）参数下的达成年龄；无法达标返回 None。
+
+    实际收入增长率为 0 时走闭式解；不为 0 时储蓄逐年变化，闭式解失效，
+    改为逐月迭代（月储蓄按年阶梯上调）。
+    """
     if nominal_pct is None:
         nominal_pct = ctx.nominal
     if inflation_pct is None:
         inflation_pct = ctx.inflation
     if annual_save is None:
         annual_save = ctx.annual_save
+    if income_growth_pct is None:
+        income_growth_pct = ctx.income_growth
 
     r_month = monthly_rate(real_rate(nominal_pct, inflation_pct))
-    try:
-        months = months_to_target(
-            ctx.principal, annual_save / MONTHS_PER_YEAR, ctx.target, r_month
-        )
-    except TargetUnreachable:
-        return None
-    return ctx.age + months / MONTHS_PER_YEAR
+    growth = real_income_growth(income_growth_pct, inflation_pct)
+
+    if abs(growth) < ASSERT_TOLERANCE:
+        try:
+            months = months_to_target(
+                ctx.principal, annual_save / MONTHS_PER_YEAR, ctx.target, r_month
+            )
+        except TargetUnreachable:
+            return None
+        return ctx.age + months / MONTHS_PER_YEAR
+
+    if ctx.principal >= ctx.target:
+        return ctx.age
+    assets = ctx.principal
+    for month in range(1, MAX_MONTHS + 1):
+        year_index = (month - 1) // MONTHS_PER_YEAR
+        monthly_save = annual_save * (1 + growth) ** year_index / MONTHS_PER_YEAR
+        assets += assets * r_month + monthly_save
+        if assets >= ctx.target:
+            return ctx.age + month / MONTHS_PER_YEAR
+    return None
 
 
 def build_lifeline(ctx):
@@ -448,12 +710,10 @@ def build_lifeline(ctx):
             saved = 0.0
             phase = "退休"
         else:
-            saved = ctx.annual_save
-            earned = 0.0
-            for _ in range(MONTHS_PER_YEAR):
-                interest = assets * ctx.r_month
-                assets += interest + ctx.monthly_save
-                earned += interest
+            saved = annual_save_at(ctx, age - ctx.age - 1)
+            assets, earned = accumulate_one_year(
+                assets, saved / MONTHS_PER_YEAR, ctx.r_month
+            )
             withdraw = 0.0
             if assets >= ctx.target:
                 phase = "达成"
@@ -475,8 +735,8 @@ def accumulation_trajectory(ctx, nominal_pct):
     rows = []
     assets = ctx.principal
     for age in range(ctx.age + 1, ctx.life_expectancy + 1):
-        for _ in range(MONTHS_PER_YEAR):
-            assets += assets * r_month + ctx.monthly_save
+        saved = annual_save_at(ctx, age - ctx.age - 1)
+        assets, _ = accumulate_one_year(assets, saved / MONTHS_PER_YEAR, r_month)
         rows.append((age, assets))
         if assets >= ctx.target:
             break
@@ -509,6 +769,9 @@ def sensitivity(ctx):
         ("年储蓄", "+10%", {"annual_save": ctx.annual_save * 1.1}, None),
         ("年储蓄", "-10%", {"annual_save": ctx.annual_save * 0.9},
          "年储蓄比预期低 10%"),
+        ("收入增长率", "+1.0%", {"income_growth_pct": ctx.income_growth + 1.0}, None),
+        ("收入增长率", "-1.0%", {"income_growth_pct": ctx.income_growth - 1.0},
+         "收入增长率比预期低 1 个百分点"),
         ("通胀率", "+1.0%", {"inflation_pct": ctx.inflation + 1.0},
          "通胀率比预期高 1 个百分点"),
     ]
@@ -537,6 +800,22 @@ def cross_check(principal, monthly_save, target, r_month, months_exact):
         raise AssertionError(
             f"闭式解 {months_exact:.6f} 个月，但第 {months - 1} 个月末已提前达标"
         )
+
+
+def cross_check_lifeline(ctx, rows, free_age):
+    """校验达成年龄落在逐年明细表标记「达成」的那一年内。"""
+    if free_age is None or free_age >= ctx.life_expectancy:
+        return
+    if ctx.principal >= ctx.target:
+        return
+    for age, _assets, _saved, _withdraw, _earned, phase in rows:
+        if phase == "达成":
+            if not age - 1 < free_age <= age:
+                raise AssertionError(
+                    f"达成年龄 {free_age:.4f} 岁与逐年表的达成年 {age} 岁不符"
+                )
+            return
+    raise AssertionError(f"达成年龄 {free_age:.4f} 岁，但逐年表未标记达成年")
 
 
 # --------------------------------------------------------------------------
@@ -577,15 +856,43 @@ def format_summary(ctx):
         if rate is not None:
             saving_line += f"  储蓄率 {rate * 100:.1f}%"
 
-    return "\n".join([
+    lines = [
         "=== 口径 ===",
         f"年龄 {ctx.age} 岁  预期寿命 {ctx.life_expectancy} 岁",
         f"名义 {ctx.nominal:.1f}%  通胀 {ctx.inflation:.1f}%"
         f"  →  实际收益率 {ctx.real * 100:.3f}%",
+        f"名义收入增长率 {ctx.income_growth:.1f}%"
+        f"  →  实际收入增长率 {ctx.real_income_growth * 100:.3f}%",
         saving_line,
         f"年支出 {format_wan(ctx.annual_expense)} × (1/{ctx.withdrawal:.1f}%)"
         f" = {multiple:.1f} 倍  →  自由门槛 {format_wan(ctx.target)}（今天购买力）",
-    ])
+    ]
+    if ctx.expense_items is not None:
+        if ctx.city_tier:
+            lines.append(
+                f"支出明细模式：{ctx.city_tier}城市"
+                f"（消费水平 ≈ 全国基准的 {CITY_TIERS[ctx.city_tier]:.1f} 倍，"
+                f"参考值为粗略估算）"
+            )
+        else:
+            lines.append("支出明细模式：命令行分项合计（参考值不参与计算）")
+    return "\n".join(lines)
+
+
+def format_expense_breakdown(rows):
+    """分项支出表：按年化金额降序列出，末行为合计。"""
+    total = sum(row[2] for row in rows)
+    lines = [
+        "=== 支出明细 ===",
+        pad(" 年化金额(万)", 15) + pad("占比", 9) + pad("类目", 8) + "条目",
+    ]
+    for category, name, amount, ratio in rows:
+        lines.append(
+            pad(f"{amount / WAN:>9.1f}", 15) + pad(f"{ratio * 100:.1f}%", 9)
+            + pad(category, 8) + name
+        )
+    lines.append(pad(f"{total / WAN:>9.1f}", 15) + pad("100.0%", 9) + "合计")
+    return "\n".join(lines)
 
 
 def format_conclusion(ctx, rows, sens):
@@ -752,8 +1059,11 @@ def sample_params():
         "nominal": DEFAULT_RETURN,
         "inflation": DEFAULT_INFLATION,
         "withdrawal": DEFAULT_WITHDRAWAL,
+        "income_growth": DEFAULT_INFLATION,
         "life_expectancy": 85,
         "goal_years": None,
+        "expense_items": None,
+        "city_tier": None,
     }
 
 
@@ -798,6 +1108,7 @@ def run_selftest():
         "annual_income": None, "annual_expense": 500_000.0,
         "annual_save": 0.0,
         "nominal": 0.0, "inflation": DEFAULT_INFLATION, "withdrawal": DEFAULT_WITHDRAWAL,
+        "income_growth": DEFAULT_INFLATION,
         "life_expectancy": 95, "goal_years": None,
     })
     depleted = depletion_age(build_lifeline(starving))
@@ -818,6 +1129,57 @@ def run_selftest():
         base_age is not None and better_age is not None and better_age <= base_age
     )
     cases.append(("敏感度单调性", ok, f"{base_age:.2f} → {better_age:.2f}"))
+
+    # 9. 分项年化与合计：3,000 元/月 + 20,000 元/年 = 56,000 元
+    rent = ExpenseItem("住房", "房租", 3000.0, "月")
+    trip = ExpenseItem("旅行", "旅行", 20000.0, "年")
+    total = expense_items_total([rent, trip])
+    cases.append(("分项年化与合计", abs(total - 56_000.0) < 1e-9, f"合计 {total:,.0f} 元"))
+
+    # 10. 分项占比
+    parts = expense_breakdown([rent, trip])
+    ok = (
+        abs(parts[0][3] - 36_000.0 / 56_000.0) < 1e-9
+        and abs(parts[1][3] - 20_000.0 / 56_000.0) < 1e-9
+    )
+    cases.append(("分项占比", ok, f"{parts[0][3] * 100:.1f}% / {parts[1][3] * 100:.1f}%"))
+
+    # 11. 城市乘数参考值：全国基准 2,000 × 1.3 = 2,600
+    reference = baseline_expense(EXPENSE_CATALOG[0], 1.3)
+    cases.append(("城市乘数参考值", abs(reference - 2600.0) < 1e-9, f"2,000 × 1.3 = {reference:,.0f}"))
+
+    # 12. 收入增长加速积累：名义增长率 +5% 应早于名义增长率 0
+    earlier = reach_age(healthy, income_growth_pct=healthy.inflation + 5.0)
+    flat = reach_age(healthy, income_growth_pct=0.0)
+    ok = earlier is not None and flat is not None and earlier < flat
+    cases.append(("收入增长加速", ok, f"{earlier:.2f} < {flat:.2f} 岁"))
+
+    # 13. 收入负增长减速：名义增长率 -5% 应晚于名义增长率 0
+    later = reach_age(healthy, income_growth_pct=healthy.inflation - 5.0)
+    ok = flat is not None and later is not None and later > flat
+    cases.append(("收入负增长减速", ok, f"{later:.2f} > {flat:.2f} 岁"))
+
+    # 14. 增长口径一致性：达成年龄必须落在逐年表的「达成」年内
+    consistent = []
+    for growth in (DEFAULT_INFLATION, DEFAULT_INFLATION + 3.0):
+        params = sample_params()
+        params["income_growth"] = growth
+        ctx = build_context(params)
+        try:
+            cross_check_lifeline(ctx, build_lifeline(ctx), reach_age(ctx))
+            consistent.append(True)
+        except AssertionError:
+            consistent.append(False)
+    cases.append((
+        "增长口径一致性", all(consistent),
+        f"名义增长率 {DEFAULT_INFLATION}% / {DEFAULT_INFLATION + 3.0}% 均与逐年表一致",
+    ))
+
+    # 15. 默认跟随通胀率：实际收入增长率为 0，结果与第 2 版基准一致
+    zero = abs(real_income_growth(DEFAULT_INFLATION, DEFAULT_INFLATION)) < 1e-15
+    age = reach_age(healthy)
+    ok = zero and age is not None and 40.1 < age < 40.3
+    cases.append(("默认跟随通胀率", ok, f"实际收入增长率 0，达成 {age:.2f} 岁"))
 
     failed = sum(1 for _, ok, _ in cases if not ok)
     for name, ok, detail in cases:
@@ -877,38 +1239,43 @@ def run_cli(argv=None):
 def main(argv=None):
     raw = list(sys.argv[1:] if argv is None else argv)
 
+    scenario_rates = None
+    show_table = True
+    show_chart = True
     if raw:
         args = parse_args(raw)
         if args.selftest:
             return run_selftest()
-        params = params_from_args(args)
         scenario_rates = args.scenario
         show_table = not args.no_table
         show_chart = not args.no_chart
-    else:
-        params = ask_params()
-        scenario_rates = None
-        show_table = True
-        show_chart = True
 
     try:
+        params = params_from_args(args) if raw else ask_params()
         ctx = build_context(params)
     except ValueError as exc:
         print(f"参数错误：{exc}", file=sys.stderr)
         return 2
 
-    # 闭式解必须与逐月迭代吻合，否则说明公式实现有误
-    try:
-        months = months_to_target(ctx.principal, ctx.monthly_save, ctx.target, ctx.r_month)
-    except TargetUnreachable:
-        pass
-    else:
-        cross_check(ctx.principal, ctx.monthly_save, ctx.target, ctx.r_month, months)
+    # 储蓄恒定时闭式解必须与逐月迭代吻合，否则说明公式实现有误
+    if abs(ctx.real_income_growth) < ASSERT_TOLERANCE:
+        try:
+            months = months_to_target(
+                ctx.principal, ctx.monthly_save, ctx.target, ctx.r_month
+            )
+        except TargetUnreachable:
+            pass
+        else:
+            cross_check(ctx.principal, ctx.monthly_save, ctx.target, ctx.r_month, months)
 
     rows = build_lifeline(ctx)
+    cross_check_lifeline(ctx, rows, reach_age(ctx))
     sens = sensitivity(ctx)
 
     print(format_summary(ctx))
+    if ctx.expense_items is not None:
+        print()
+        print(format_expense_breakdown(expense_breakdown(ctx.expense_items)))
     print()
     print(format_conclusion(ctx, rows, sens))
     print()
